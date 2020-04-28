@@ -2,41 +2,24 @@
 
 namespace app\controllers;
 
+use app\models\MerchantProducts;
+use app\service\ExcelProviderService;
 use Yii;
-use yii\filters\AccessControl;
+use yii\db\Exception;
 use yii\web\Controller;
 use yii\web\Response;
-use yii\filters\VerbFilter;
-use app\models\LoginForm;
-use app\models\ContactForm;
+use yii\web\UploadedFile;
+
+use app\models\UploadForm;
 
 class SiteController extends Controller
 {
-    /**
-     * {@inheritdoc}
-     */
-    public function behaviors()
-    {
-        return [
-            'access' => [
-                'class' => AccessControl::className(),
-                'only' => ['logout'],
-                'rules' => [
-                    [
-                        'actions' => ['logout'],
-                        'allow' => true,
-                        'roles' => ['@'],
-                    ],
-                ],
-            ],
-            'verbs' => [
-                'class' => VerbFilter::className(),
-                'actions' => [
-                    'logout' => ['post'],
-                ],
-            ],
-        ];
-    }
+    /** @var array $columnsName Наименования столбцов для таблицы */
+    private $columnsName;
+    /** @var array $dataProvider Данные считанные из таблицы */
+    private $dataProvider;
+    /** @var string $fileName Имя файла с данными */
+    private $fileName;
 
     /**
      * {@inheritdoc}
@@ -55,74 +38,147 @@ class SiteController extends Controller
     }
 
     /**
-     * Displays homepage.
-     *
+     * Загрузка файла.
      * @return string
      */
     public function actionIndex()
     {
-        return $this->render('index');
-    }
+        $model = new UploadForm();
 
-    /**
-     * Login action.
-     *
-     * @return Response|string
-     */
-    public function actionLogin()
-    {
-        if (!Yii::$app->user->isGuest) {
-            return $this->goHome();
+        if (Yii::$app->request->isPost) {
+            $model->load(Yii::$app->request->post());
+            $model->fileName = UploadedFile::getInstance($model, 'fileName');
+            if ($model->upload()) {
+                return $this->redirect([
+                    'site/select-fields',
+                    'fileName' => $model->fileName->name,
+                    'encoding' => $model->encoding,
+                    'separator' => $model->separator
+                ]);
+            }
         }
 
-        $model = new LoginForm();
-        if ($model->load(Yii::$app->request->post()) && $model->login()) {
-            return $this->goBack();
-        }
-
-        $model->password = '';
-        return $this->render('login', [
-            'model' => $model,
-        ]);
+        return $this->render('index', ['model' => $model]);
     }
 
     /**
-     * Logout action.
-     *
-     * @return Response
-     */
-    public function actionLogout()
-    {
-        Yii::$app->user->logout();
-
-        return $this->goHome();
-    }
-
-    /**
-     * Displays contact page.
-     *
-     * @return Response|string
-     */
-    public function actionContact()
-    {
-        $model = new ContactForm();
-        if ($model->load(Yii::$app->request->post()) && $model->contact(Yii::$app->params['adminEmail'])) {
-            Yii::$app->session->setFlash('contactFormSubmitted');
-
-            return $this->refresh();
-        }
-        return $this->render('contact', [
-            'model' => $model,
-        ]);
-    }
-
-    /**
-     * Displays about page.
-     *
+     * Выбор колонок для импорта данных.
+     * @param $fileName
+     * @param null $encoding
+     * @param null $separator
      * @return string
+     * @throws \PhpOffice\PhpSpreadsheet\Exception
      */
-    public function actionAbout()
+    public function actionSelectFields($fileName, $encoding = null, $separator = null)
     {
-        return $this->render('about');
+        if (!$this->getExcelData($fileName, $encoding, $separator)) {
+            Yii::$app->session->setFlash('error', 'Невозможно загрузить данные');
+            return $this->redirect(['index']);
+        }
+        return $this->render('select-fields', [
+            'fileName' => $fileName,
+            'columnsName' => $this->columnsName,
+            'dataProvider' => $this->dataProvider,
+            'encoding' => $encoding,
+            'separator' => $separator
+        ]);
+    }
+
+    /**
+     * Сохранить Excel таблицу в базу данных на основе выбранных столбцов.
+     * @param string $fileName
+     * @param string $params
+     * @param string|null $encoding
+     * @param string|null $separator
+     * @return Response
+     * @throws Exception
+     * @throws \PhpOffice\PhpSpreadsheet\Exception
+     */
+    public function actionSaveToTable($fileName, $params, $encoding = null, $separator = null)
+    {
+        if (!$this->getExcelData($fileName, $encoding, $separator)) {
+            Yii::$app->session->setFlash('error', 'Невозможно загрузить данные');
+            return $this->redirect(['index']);
+        }
+
+        $importConfig = json_decode($params, true);
+
+        $result = $this->saveDataToDbTable($importConfig);
+
+        if ($result > 0) {
+            Yii::$app->session->setFlash('success', 'Данные успешно сохранены!');
+        } else {
+            Yii::$app->session->setFlash('error', 'Данные не были добавлены');
+        }
+
+        return $this->redirect(['index']);
+    }
+
+    /**
+     * Считывает данные из Excel файла в массив данных.
+     * @param $fileName
+     * @param null $encoding
+     * @param null $separator
+     * @return bool
+     * @throws \PhpOffice\PhpSpreadsheet\Exception
+     */
+    private function getExcelData($fileName, $encoding = null, $separator = null)
+    {
+        // Сервис для обраоботки данных.
+        $excelProviderService = new ExcelProviderService($fileName, $encoding, $separator);
+        // Загружаем данные.
+        $this->dataProvider = $excelProviderService->getExcelTableData();
+        if (!$this->dataProvider) {
+            return false;
+        }
+        // А также получаем массив с колонками, которые необходимо выбрать.
+        $this->columnsName = $excelProviderService->getColumnsData();
+        if (!$this->columnsName) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Сохранение данных в БД.
+     * Этот метод использует низкоуровневую пакетную загрузку для оптимизации.
+     * @param array $importConfig
+     * @throws Exception
+     * @return int Число обработанных строк
+     */
+    private function saveDataToDbTable($importConfig)
+    {
+        // Получаем подключение к БД.
+        $connection = Yii::$app->db;
+
+        // Строим массив столбцов для таблицы БД.
+        $columns = [];
+        foreach ($importConfig as $element) {
+            $columns[] = $element['value'];
+        }
+
+        // Добаивим колонку created_at так как не используется высокоуровневый доступ и TimestampBehavior не работает.
+        $columns[] = 'created_at';
+
+        // Значение для created_at чтобы не вызывать функцию многократно.
+        $createdAtValue = time();
+
+        // Заполняем данные.
+        $data = [];
+        foreach ($this->dataProvider as $row) {
+            $fileDataRow = [];
+            foreach($importConfig as $cell) {
+                $fileDataRow[] = $row[$cell['data']];
+            }
+            $fileDataRow[] = $createdAtValue;
+            $data[] = $fileDataRow;
+        }
+
+        // Сохраняем данные в таблицу.
+        return $connection->createCommand()->batchInsert(
+            MerchantProducts::tableName(),
+            $columns,
+            $data
+        )->execute();
     }
 }
